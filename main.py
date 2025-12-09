@@ -2,404 +2,280 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import serial
 import serial.tools.list_ports
-import threading
-import time
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.animation import FuncAnimation
+import threading
+import time
 from collections import deque
 
 
-class InterfazBalancinPID:
+class PIDControllerGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Control Balancín PID")
-        self.root.geometry("800x600")
+        self.root.title("Control PID - Sensor Ultrasónico")
+        self.root.geometry("1000x700")
 
-        # Variables
-        self.arduino = None
-        self.conectado = False
-        self.puerto_seleccionado = tk.StringVar()
+        self.serial_port = None
+        self.is_connected = False
+        self.is_reading = False
 
-        # Datos para gráfica
-        self.posiciones = deque(maxlen=100)
-        self.tiempos = deque(maxlen=100)
+        # Datos para graficar
+        self.max_points = 200
+        self.time_data = deque(maxlen=self.max_points)
+        self.distance_data = deque(maxlen=self.max_points)
+        self.error_data = deque(maxlen=self.max_points)
         self.start_time = time.time()
 
-        # Crear interfaz
-        self.crear_interfaz()
-        self.buscar_puertos()
+        self.setup_ui()
 
-    def crear_interfaz(self):
-        # Frame de conexión
-        frame_conexion = ttk.LabelFrame(self.root, text="Conexión Arduino", padding=10)
-        frame_conexion.pack(fill="x", padx=10, pady=5)
+    def setup_ui(self):
+        # Frame superior para conexión
+        conn_frame = ttk.LabelFrame(self.root, text="Conexión Serial", padding=10)
+        conn_frame.pack(fill='x', padx=10, pady=5)
 
-        ttk.Label(frame_conexion, text="Puerto:").grid(row=0, column=0, padx=5)
-        self.combo_puertos = ttk.Combobox(frame_conexion, textvariable=self.puerto_seleccionado, width=20)
-        self.combo_puertos.grid(row=0, column=1, padx=5)
+        ttk.Label(conn_frame, text="Puerto:").grid(row=0, column=0, padx=5)
+        self.port_combo = ttk.Combobox(conn_frame, width=15, state='readonly')
+        self.port_combo.grid(row=0, column=1, padx=5)
+        self.refresh_ports()
 
-        ttk.Button(frame_conexion, text="Buscar Puertos", command=self.buscar_puertos).grid(row=0, column=2, padx=5)
-        self.btn_conectar = ttk.Button(frame_conexion, text="Conectar", command=self.toggle_conexion)
-        self.btn_conectar.grid(row=0, column=3, padx=5)
+        ttk.Button(conn_frame, text="🔄", command=self.refresh_ports, width=3).grid(row=0, column=2, padx=2)
 
-        # Indicador de estado
-        self.indicador = ttk.Label(frame_conexion, text="🔴 Desconectado", foreground="red")
-        self.indicador.grid(row=0, column=4, padx=10)
+        self.connect_btn = ttk.Button(conn_frame, text="Conectar", command=self.toggle_connection)
+        self.connect_btn.grid(row=0, column=3, padx=5)
 
-        # Frame principal
-        frame_principal = ttk.Frame(self.root)
-        frame_principal.pack(fill="both", expand=True, padx=10, pady=5)
+        self.status_label = ttk.Label(conn_frame, text="● Desconectado", foreground="red")
+        self.status_label.grid(row=0, column=4, padx=10)
 
-        # Frame de control PID
-        frame_control = ttk.LabelFrame(frame_principal, text="Control PID", padding=10)
-        frame_control.pack(side="left", fill="y", padx=5)
+        # Frame para controles PID
+        control_frame = ttk.LabelFrame(self.root, text="Parámetros PID", padding=10)
+        control_frame.pack(fill='x', padx=10, pady=5)
 
-        # Controles PID
-        self.crear_controles_pid(frame_control)
+        # KP
+        ttk.Label(control_frame, text="Kp:").grid(row=0, column=0, sticky='e', padx=5)
+        self.kp_var = tk.DoubleVar(value=15.0)
+        self.kp_entry = ttk.Entry(control_frame, textvariable=self.kp_var, width=10)
+        self.kp_entry.grid(row=0, column=1, padx=5)
+        self.kp_scale = ttk.Scale(control_frame, from_=0, to=50, orient='horizontal',
+                                  length=200, command=lambda v: self.kp_var.set(float(v)))
+        self.kp_scale.set(15.0)
+        self.kp_scale.grid(row=0, column=2, padx=5)
+        ttk.Button(control_frame, text="Enviar", command=lambda: self.send_param("kp", self.kp_var.get())).grid(row=0,
+                                                                                                                column=3,
+                                                                                                                padx=5)
 
-        # Frame de gráfica
-        frame_grafica = ttk.LabelFrame(frame_principal, text="Posición de la Pelota", padding=10)
-        frame_grafica.pack(side="right", fill="both", expand=True, padx=5)
+        # KI
+        ttk.Label(control_frame, text="Ki:").grid(row=1, column=0, sticky='e', padx=5)
+        self.ki_var = tk.DoubleVar(value=0.6)
+        self.ki_entry = ttk.Entry(control_frame, textvariable=self.ki_var, width=10)
+        self.ki_entry.grid(row=1, column=1, padx=5)
+        self.ki_scale = ttk.Scale(control_frame, from_=0, to=5, orient='horizontal',
+                                  length=200, command=lambda v: self.ki_var.set(float(v)))
+        self.ki_scale.set(0.6)
+        self.ki_scale.grid(row=1, column=2, padx=5)
+        ttk.Button(control_frame, text="Enviar", command=lambda: self.send_param("ki", self.ki_var.get())).grid(row=1,
+                                                                                                                column=3,
+                                                                                                                padx=5)
 
-        self.crear_grafica(frame_grafica)
+        # KD
+        ttk.Label(control_frame, text="Kd:").grid(row=2, column=0, sticky='e', padx=5)
+        self.kd_var = tk.DoubleVar(value=48.0)
+        self.kd_entry = ttk.Entry(control_frame, textvariable=self.kd_var, width=10)
+        self.kd_entry.grid(row=2, column=1, padx=5)
+        self.kd_scale = ttk.Scale(control_frame, from_=0, to=200, orient='horizontal',
+                                  length=200, command=lambda v: self.kd_var.set(float(v)))
+        self.kd_scale.set(48.0)
+        self.kd_scale.grid(row=2, column=2, padx=5)
+        ttk.Button(control_frame, text="Enviar", command=lambda: self.send_param("kd", self.kd_var.get())).grid(row=2,
+                                                                                                                column=3,
+                                                                                                                padx=5)
 
-        # Consola de mensajes
-        frame_consola = ttk.LabelFrame(self.root, text="Mensajes", padding=10)
-        frame_consola.pack(fill="x", padx=10, pady=5)
+        # Referencia
+        ttk.Label(control_frame, text="Referencia:").grid(row=3, column=0, sticky='e', padx=5)
+        self.ref_var = tk.DoubleVar(value=0.0)
+        self.ref_entry = ttk.Entry(control_frame, textvariable=self.ref_var, width=10)
+        self.ref_entry.grid(row=3, column=1, padx=5)
+        self.ref_scale = ttk.Scale(control_frame, from_=-20, to=20, orient='horizontal',
+                                   length=200, command=lambda v: self.ref_var.set(float(v)))
+        self.ref_scale.set(0.0)
+        self.ref_scale.grid(row=3, column=2, padx=5)
+        ttk.Button(control_frame, text="Enviar", command=lambda: self.send_param("r", self.ref_var.get())).grid(row=3,
+                                                                                                                column=3,
+                                                                                                                padx=5)
 
-        self.consola = tk.Text(frame_consola, height=6, width=80)
-        scrollbar = ttk.Scrollbar(frame_consola, command=self.consola.yview)
-        self.consola.configure(yscrollcommand=scrollbar.set)
+        # Botón enviar todos
+        ttk.Button(control_frame, text="Enviar Todos", command=self.send_all_params).grid(row=4, column=1, columnspan=2,
+                                                                                          pady=10)
 
-        self.consola.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        # Frame para valores actuales
+        values_frame = ttk.LabelFrame(self.root, text="Valores Actuales", padding=10)
+        values_frame.pack(fill='x', padx=10, pady=5)
 
-    def crear_controles_pid(self, parent):
-        # Control KP
-        ttk.Label(parent, text="KP:").grid(row=0, column=0, sticky="w", pady=5)
-        self.kp_var = tk.DoubleVar(value=8.0)
-        self.scale_kp = ttk.Scale(parent, from_=0, to=20, variable=self.kp_var,
-                                  command=lambda v: self.actualizar_kp(float(v)))
-        self.scale_kp.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
-        self.entry_kp = ttk.Entry(parent, textvariable=self.kp_var, width=8)
-        self.entry_kp.grid(row=0, column=2, padx=5)
-        ttk.Button(parent, text="Set", command=lambda: self.actualizar_kp(self.kp_var.get())).grid(row=0, column=3,
-                                                                                                   padx=5)
+        self.dist_label = ttk.Label(values_frame, text="Distancia: -- cm", font=('Arial', 10, 'bold'))
+        self.dist_label.grid(row=0, column=0, padx=15)
 
-        # Control KI
-        ttk.Label(parent, text="KI:").grid(row=1, column=0, sticky="w", pady=5)
-        self.ki_var = tk.DoubleVar(value=0.2)
-        self.scale_ki = ttk.Scale(parent, from_=0, to=2, variable=self.ki_var,
-                                  command=lambda v: self.actualizar_ki(float(v)))
-        self.scale_ki.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
-        self.entry_ki = ttk.Entry(parent, textvariable=self.ki_var, width=8)
-        self.entry_ki.grid(row=1, column=2, padx=5)
-        ttk.Button(parent, text="Set", command=lambda: self.actualizar_ki(self.ki_var.get())).grid(row=1, column=3,
-                                                                                                   padx=5)
+        self.error_label = ttk.Label(values_frame, text="Error: --", font=('Arial', 10, 'bold'))
+        self.error_label.grid(row=0, column=1, padx=15)
 
-        # Control KD
-        ttk.Label(parent, text="KD:").grid(row=2, column=0, sticky="w", pady=5)
-        self.kd_var = tk.DoubleVar(value=3100.0)
-        self.scale_kd = ttk.Scale(parent, from_=0, to=6000, variable=self.kd_var,
-                                  command=lambda v: self.actualizar_kd(float(v)))
-        self.scale_kd.grid(row=2, column=1, sticky="ew", padx=5, pady=5)
-        self.entry_kd = ttk.Entry(parent, textvariable=self.kd_var, width=8)
-        self.entry_kd.grid(row=2, column=2, padx=5)
-        ttk.Button(parent, text="Set", command=lambda: self.actualizar_kd(self.kd_var.get())).grid(row=2, column=3,
-                                                                                                   padx=5)
+        self.servo_label = ttk.Label(values_frame, text="Servo: --°", font=('Arial', 10, 'bold'))
+        self.servo_label.grid(row=0, column=2, padx=15)
 
-        # SEPARADOR
-        ttk.Separator(parent, orient='horizontal').grid(row=3, column=0, columnspan=4, sticky="ew", pady=15)
+        # Frame para gráficas
+        graph_frame = ttk.Frame(self.root)
+        graph_frame.pack(fill='both', expand=True, padx=10, pady=5)
 
-        # Objetivo FIJO
-        ttk.Label(parent, text="Objetivo:").grid(row=4, column=0, sticky="w", pady=5)
-        ttk.Label(parent, text="Centro (0 cm)", font=('Arial', 10)).grid(row=4, column=1, columnspan=3, sticky="w",
-                                                                         pady=5)
+        # Crear figura con subplots
+        self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(10, 6))
+        self.fig.tight_layout(pad=3.0)
 
-        # Estado del PID
-        ttk.Label(parent, text="Estado PID:").grid(row=5, column=0, sticky="w", pady=10)
-        self.pid_state_var = tk.BooleanVar(value=True)
-        self.check_pid = ttk.Checkbutton(parent, text="Activo", variable=self.pid_state_var,
-                                         command=self.toggle_pid)
-        self.check_pid.grid(row=5, column=1, sticky="w", padx=5)
+        # Configurar primer gráfico (solo distancia)
+        self.ax1.set_title('Distancia del Sensor')
+        self.ax1.set_xlabel('Tiempo (s)')
+        self.ax1.set_ylabel('Distancia (cm)')
+        self.ax1.grid(True, alpha=0.3)
+        self.line_dist, = self.ax1.plot([], [], 'b-', label='Distancia', linewidth=2)
+        self.ax1.legend(loc='upper right')
 
-        # Botones de control
-        frame_botones = ttk.Frame(parent)
-        frame_botones.grid(row=6, column=0, columnspan=4, pady=15)
+        # Configurar segundo gráfico (Error)
+        self.ax2.set_title('Error del Sistema')
+        self.ax2.set_xlabel('Tiempo (s)')
+        self.ax2.set_ylabel('Error (cm)')
+        self.ax2.grid(True, alpha=0.3)
+        self.line_error, = self.ax2.plot([], [], 'g-', label='Error', linewidth=2)
+        self.ax2.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+        self.ax2.legend(loc='upper right')
 
-        ttk.Button(frame_botones, text="Aplicar Parámetros", command=self.enviar_todos).pack(side="left", padx=5)
-        ttk.Button(frame_botones, text="Leer Estado", command=self.leer_estado).pack(side="left", padx=5)
-        ttk.Button(frame_botones, text="Reset PID", command=self.reset_pid).pack(side="left", padx=5)
+        # Integrar matplotlib en tkinter
+        self.canvas = FigureCanvasTkAgg(self.fig, master=graph_frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill='both', expand=True)
 
-        # Labels de valores actuales
-        ttk.Label(parent, text="Valores Actuales:", font=('Arial', 10, 'bold')).grid(row=7, column=0, columnspan=4,
-                                                                                     pady=(20, 5))
+        # Iniciar animación
+        self.anim = FuncAnimation(self.fig, self.update_plot, interval=100, blit=False)
 
-        self.label_posicion = ttk.Label(parent, text="Posición Pelota: -- cm")
-        self.label_posicion.grid(row=8, column=0, columnspan=4, sticky="w", pady=2)
+    def refresh_ports(self):
+        ports = [port.device for port in serial.tools.list_ports.comports()]
+        self.port_combo['values'] = ports
+        if ports:
+            self.port_combo.current(0)
 
-        self.label_error = ttk.Label(parent, text="Error: -- cm")
-        self.label_error.grid(row=9, column=0, columnspan=4, sticky="w", pady=2)
-
-        self.label_pid_out = ttk.Label(parent, text="Salida PID: --")
-        self.label_pid_out.grid(row=10, column=0, columnspan=4, sticky="w", pady=2)
-
-        self.label_estado = ttk.Label(parent, text="Acción: --")
-        self.label_estado.grid(row=11, column=0, columnspan=4, sticky="w", pady=2)
-
-    def crear_grafica(self, parent):
-        self.fig, self.ax = plt.subplots(figsize=(6, 4))
-        self.line_pos, = self.ax.plot([], [], 'b-', label='Posición Pelota', linewidth=2)
-
-        # Línea del objetivo en 0
-        self.line_objetivo = self.ax.axhline(y=0, color='red', linestyle='--', linewidth=2, label='Objetivo (0cm)')
-
-        # Líneas de referencia
-        self.ax.axhline(y=-20, color='gray', linestyle=':', alpha=0.5, label='-20cm')
-        self.ax.axhline(y=20, color='gray', linestyle=':', alpha=0.5, label='+20cm')
-
-        self.ax.set_xlabel('Tiempo (s)')
-        self.ax.set_ylabel('Posición (cm)')
-        self.ax.legend()
-        self.ax.grid(True, alpha=0.3)
-        self.ax.set_ylim(-25, 25)
-
-        self.canvas = FigureCanvasTkAgg(self.fig, parent)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
-
-    def buscar_puertos(self):
-        puertos = [port.device for port in serial.tools.list_ports.comports()]
-        self.combo_puertos['values'] = puertos
-        if puertos:
-            self.puerto_seleccionado.set(puertos[0])
-            self.mostrar_mensaje(f"Puertos encontrados: {', '.join(puertos)}")
+    def toggle_connection(self):
+        if not self.is_connected:
+            self.connect()
         else:
-            self.mostrar_mensaje("⚠️ No se encontraron puertos")
+            self.disconnect()
 
-    def toggle_conexion(self):
-        if not self.conectado:
-            self.conectar_arduino()
-        else:
-            self.desconectar_arduino()
+    def connect(self):
+        port = self.port_combo.get()
+        if not port:
+            messagebox.showerror("Error", "Selecciona un puerto serial")
+            return
 
-    def conectar_arduino(self):
-        self.btn_conectar.config(state="disabled")
-        self.mostrar_mensaje("Conectando...")
-        threading.Thread(target=self._conectar_arduino_thread, daemon=True).start()
-
-    def _conectar_arduino_thread(self):
         try:
-            puertos_disponibles = [port.device for port in serial.tools.list_ports.comports()]
-            puerto_elegido = self.puerto_seleccionado.get()
+            self.serial_port = serial.Serial(port, 9600, timeout=1)
+            time.sleep(2)  # Esperar inicialización
+            self.is_connected = True
+            self.is_reading = True
 
-            if not puerto_elegido or puerto_elegido not in puertos_disponibles:
-                self.root.after(0, lambda: messagebox.showerror("Error", "Puerto no encontrado"))
-                self.root.after(0, self._reestablecer_conexion)
-                return
+            self.connect_btn.config(text="Desconectar")
+            self.status_label.config(text="● Conectado", foreground="green")
+            self.port_combo.config(state='disabled')
 
-            self.root.after(0, lambda: self.mostrar_mensaje(f"Conectando a {puerto_elegido}..."))
+            # Iniciar hilo de lectura
+            self.read_thread = threading.Thread(target=self.read_serial, daemon=True)
+            self.read_thread.start()
 
-            arduino = serial.Serial(puerto_elegido, 9600, timeout=1)
-            time.sleep(2)
-
-            arduino.reset_input_buffer()
-            arduino.write(b"STATUS\n")
-            time.sleep(1)
-
-            if arduino.in_waiting > 0:
-                respuesta = arduino.readline().decode().strip()
-                self.root.after(0, lambda: self.mostrar_mensaje(f"Arduino: {respuesta}"))
-
-                if any(keyword in respuesta for keyword in ["ESTADO", "Balancin", "KP", "SET"]):
-                    self.arduino = arduino
-                    self.conectado = True
-
-                    self.root.after(0, self._conexion_exitosa)
-
-                    self.hilo_lectura = threading.Thread(target=self.leer_serial, daemon=True)
-                    self.hilo_lectura.start()
-
-                    self.leer_estado()
-                else:
-                    arduino.close()
-                    self.root.after(0, self._reestablecer_conexion)
-            else:
-                arduino.close()
-                self.root.after(0, self._reestablecer_conexion)
-
+            messagebox.showinfo("Conectado", f"Conectado a {port}")
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("Error", f"Error: {str(e)}"))
-            self.root.after(0, self._reestablecer_conexion)
+            messagebox.showerror("Error", f"No se pudo conectar: {str(e)}")
 
-    def _conexion_exitosa(self):
-        self.btn_conectar.config(text="Desconectar", state="normal")
-        self.indicador.config(text="🟢 Conectado", foreground="green")
-        self.mostrar_mensaje("✅ Conectado")
+    def disconnect(self):
+        self.is_reading = False
+        time.sleep(0.5)
 
-    def _reestablecer_conexion(self):
-        self.btn_conectar.config(text="Conectar", state="normal")
-        self.indicador.config(text="🔴 Desconectado", foreground="red")
+        if self.serial_port:
+            self.serial_port.close()
 
-    def desconectar_arduino(self):
-        if self.arduino and self.arduino.is_open:
-            self.arduino.close()
-        self.conectado = False
-        self.btn_conectar.config(text="Conectar")
-        self.indicador.config(text="🔴 Desconectado", foreground="red")
-        self.mostrar_mensaje("🔌 Desconectado")
+        self.is_connected = False
+        self.connect_btn.config(text="Conectar")
+        self.status_label.config(text="● Desconectado", foreground="red")
+        self.port_combo.config(state='readonly')
 
-    def leer_serial(self):
-        while self.conectado:
+    def read_serial(self):
+        while self.is_reading:
             try:
-                if self.arduino and self.arduino.in_waiting > 0:
-                    linea = self.arduino.readline().decode().strip()
-                    if linea:
-                        self.procesar_mensaje_arduino(linea)
+                if self.serial_port.in_waiting:
+                    line = self.serial_port.readline().decode('utf-8', errors='ignore').strip()
+                    self.parse_data(line)
             except Exception as e:
-                break
-            time.sleep(0.01)
+                print(f"Error leyendo serial: {e}")
+                time.sleep(0.1)
 
-    def procesar_mensaje_arduino(self, mensaje):
-        if mensaje.startswith("DATA:"):
-            try:
-                datos = mensaje[5:].split(",")
-                if len(datos) >= 7:
-                    posicion_pelota = float(datos[0])
-                    pid_out = float(datos[1])
-                    pid_active = bool(int(datos[2]))
-                    kp = float(datos[3])
-                    ki = float(datos[4])
-                    kd = float(datos[5])
-                    setpoint = float(datos[6])
+    def parse_data(self, line):
+        try:
+            parts = line.split()
+            data = {}
 
-                    error = -posicion_pelota
+            for i in range(0, len(parts), 2):
+                if i + 1 < len(parts):
+                    key = parts[i].rstrip(':')
+                    value = parts[i + 1]
+                    data[key] = float(value)
 
-                    if abs(posicion_pelota) < 0.5:
-                        accion = "Centrado"
-                    elif posicion_pelota > 0:
-                        accion = "Mover derecha"
-                    else:
-                        accion = "Mover izquierda"
+            if 'Dist' in data:
+                current_time = time.time() - self.start_time
+                self.time_data.append(current_time)
+                self.distance_data.append(data.get('Dist', 0))
+                self.error_data.append(data.get('Error', 0))
 
-                    self.actualizar_valores_ui(posicion_pelota, error, pid_out, accion, pid_active, kp, ki, kd)
-                    self.actualizar_grafica(posicion_pelota)
+                # Actualizar labels
+                self.dist_label.config(text=f"Distancia: {data.get('Dist', 0):.2f} cm")
+                self.error_label.config(text=f"Error: {data.get('Error', 0):.2f}")
+                self.servo_label.config(text=f"Servo: {int(data.get('Servo', 90))}°")
+        except:
+            pass
 
-            except ValueError as e:
-                pass
+    def update_plot(self, frame):
+        if len(self.time_data) > 0:
+            # Actualizar línea de distancia
+            self.line_dist.set_data(list(self.time_data), list(self.distance_data))
+            self.line_error.set_data(list(self.time_data), list(self.error_data))
 
-        elif mensaje.startswith("ESTADO:"):
-            self.mostrar_mensaje(f"Estado: {mensaje}")
-        else:
-            self.mostrar_mensaje(f"Arduino: {mensaje}")
+            # Ajustar límites
+            self.ax1.relim()
+            self.ax1.autoscale_view()
+            self.ax2.relim()
+            self.ax2.autoscale_view()
 
-    def actualizar_valores_ui(self, posicion_pelota, error, pid_out, accion, pid_active, kp, ki, kd):
-        def actualizar():
-            signo = "+" if posicion_pelota >= 0 else ""
-            self.label_posicion.config(text=f"Posición Pelota: {signo}{posicion_pelota:.2f} cm")
-            self.label_error.config(text=f"Error: {error:+.2f} cm")
-            self.label_pid_out.config(text=f"Salida PID: {pid_out:.1f}")
-            self.label_estado.config(text=f"Acción: {accion}")
-            self.pid_state_var.set(pid_active)
+        return self.line_dist, self.line_error
 
-            if abs(self.kp_var.get() - kp) > 0.01:
-                self.kp_var.set(kp)
-            if abs(self.ki_var.get() - ki) > 0.001:
-                self.ki_var.set(ki)
-            if abs(self.kd_var.get() - kd) > 1:
-                self.kd_var.set(kd)
+    def send_param(self, param, value):
+        if not self.is_connected:
+            messagebox.showwarning("Advertencia", "No estás conectado al Arduino")
+            return
 
-        self.root.after(0, actualizar)
+        try:
+            command = f"{param} {value}\n"
+            self.serial_port.write(command.encode())
+            print(f"Enviado: {command.strip()}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error enviando comando: {str(e)}")
 
-    def actualizar_grafica(self, posicion_pelota):
-        current_time = time.time() - self.start_time
+    def send_all_params(self):
+        if not self.is_connected:
+            messagebox.showwarning("Advertencia", "No estás conectado al Arduino")
+            return
 
-        self.tiempos.append(current_time)
-        self.posiciones.append(posicion_pelota)
-
-        def actualizar_plot():
-            if len(self.tiempos) > 0:
-                self.line_pos.set_data(self.tiempos, self.posiciones)
-
-                if len(self.tiempos) > 1:
-                    self.ax.set_xlim(self.tiempos[0], self.tiempos[-1])
-
-                self.canvas.draw()
-
-        self.root.after(0, actualizar_plot)
-
-    def mostrar_mensaje(self, mensaje):
-        def actualizar():
-            self.consola.insert(tk.END, f"{mensaje}\n")
-            self.consola.see(tk.END)
-
-        self.root.after(0, actualizar)
-
-    def actualizar_kp(self, valor):
-        if self.conectado:
-            self.enviar_comando(f"KP:{valor}")
-
-    def actualizar_ki(self, valor):
-        if self.conectado:
-            self.enviar_comando(f"KI:{valor}")
-
-    def actualizar_kd(self, valor):
-        if self.conectado:
-            self.enviar_comando(f"KD:{valor}")
-
-    def toggle_pid(self):
-        if self.conectado:
-            self.enviar_comando("TOGGLE")
-
-    def reset_pid(self):
-        if self.conectado:
-            self.enviar_comando("RESET")
-
-    def enviar_todos(self):
-        if self.conectado:
-            self.actualizar_kp(self.kp_var.get())
-            self.actualizar_ki(self.ki_var.get())
-            self.actualizar_kd(self.kd_var.get())
-            self.mostrar_mensaje("Parámetros aplicados")
-
-    def leer_estado(self):
-        if self.conectado:
-            self.enviar_comando("STATUS")
-
-    def enviar_comando(self, comando):
-        if self.conectado and self.arduino:
-            try:
-                self.arduino.write(f"{comando}\n".encode())
-            except Exception as e:
-                self.mostrar_mensaje(f"Error: {str(e)}")
+        self.send_param("kp", self.kp_var.get())
+        time.sleep(0.1)
+        self.send_param("ki", self.ki_var.get())
+        time.sleep(0.1)
+        self.send_param("kd", self.kd_var.get())
+        time.sleep(0.1)
+        self.send_param("r", self.ref_var.get())
 
 
 if __name__ == "__main__":
     root = tk.Tk()
-
-    style = ttk.Style()
-    style.theme_use("clam")  # Tema base para personalizar
-
-    # Colores base
-    color_fondo = "#f6e3f4"
-    color_acento = "#d684ce"
-    color_texto = "#000000"
-
-    # Fondo general de la ventana
-    root.configure(bg=color_fondo)
-
-    # ---- Personalizar estilos ttk ----
-    style.configure("TFrame", background=color_fondo)
-    style.configure("TLabel", background=color_fondo, foreground=color_texto, font=("Arial", 10))
-    style.configure("TLabelFrame", background=color_fondo, foreground=color_texto, font=("Arial", 10, "bold"))
-    style.configure("TButton", background=color_acento, foreground="white", font=("Arial", 10, "bold"))
-    style.map("TButton",
-              background=[("active", "#c06ab8")],
-              foreground=[("disabled", "#999999")])
-    style.configure("TCheckbutton", background=color_fondo, foreground=color_texto)
-    style.configure("TEntry", fieldbackground="white", foreground=color_texto)
-    style.configure("TCombobox", fieldbackground="white", background=color_fondo, foreground=color_texto)
-    style.configure("Horizontal.TScale", background=color_fondo, troughcolor="#e4b5de")
-    # _
-
-    app = InterfazBalancinPID(root)
+    app = PIDControllerGUI(root)
     root.mainloop()
