@@ -1,180 +1,132 @@
-/* PID balance code with ping pong ball and distance sensor sharp 2y0a21
- *  Modified for serial communication with Python interface
- */
-#include <Wire.h>
 #include <Servo.h>
 
-///////////////////////Inputs/outputs///////////////////////
-int Analog_in = A0;
-Servo myservo;  // create servo object to control a servo, later attatched to D9
-///////////////////////////////////////////////////////
+Servo myservo;
+const int SERVO_PIN = 6;
+const int ANG_CENTRO = 90;
+const int ANG_MIN = 0;
+const int ANG_MAX = 140;
 
-////////////////////////Variables///////////////////////
-int Read = 0;
-float distance = 0.0;
-float elapsedTime, time, timePrev;        //Variables for time control
-float distance_previous_error, distance_error;
-int period = 50;  //Refresh rate period of the loop is 50ms
-///////////////////////////////////////////////////////
 
-///////////////////PID constants///////////////////////
-float kp = 8; //Mine was 8
-float ki = 0.2; //Mine was 0.2
-float kd = 3100; //Mine was 3100
-float distance_setpoint = 21;           //Should be the distance from sensor to the middle of the bar in mm
-float PID_p, PID_i, PID_d, PID_total;
-///////////////////////////////////////////////////////
+const int trigPin = 10;
+const int echoPin = 11;
+const float DIST_CENTRO = 20.0; 
 
-// Variables modificables desde serial
-bool pid_active = true;
-String inputString = "";
-bool stringComplete = false;
+float kp = 38; //30; 45
+float ki = .068; //.065 066;
+float kd = 450; //450 488;
+
+float referencia = 0;  
+
+float error = 0;
+float errorAnterior = 0;
+float integral = 0;
+float maxIntegral = 50;
+
+unsigned long tPrev = 0;
+const int T_MUESTREO = 15;
+
+float PID_output = 0;
 
 void setup() {
-  Serial.begin(9600);  
-  myservo.attach(9);  // attaches the servo on pin 9 to the servo object
-  myservo.write(125); //Put the servco at angle 125, so the balance is in the middle
-  pinMode(Analog_in, INPUT);  
-  time = millis();
-  
-  // Reservar espacio para el string de entrada
-  inputString.reserve(200);
-  
-  Serial.println("Balancin PID - Listo");
-  Serial.println("Comandos: KP,KI,KD,SET,TOGGLE,STATUS");
+  Serial.begin(9600);
+  myservo.attach(SERVO_PIN);
+  myservo.write(ANG_CENTRO);
+
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  digitalWrite(trigPin, LOW);
+
+  delay(500);
+  Serial.println("Sistema listo.");
 }
 
 void loop() {
-  // Leer comandos seriales
-  if (stringComplete) {
-    procesarComando();
-    inputString = "";
-    stringComplete = false;
+  
+  leerComandosSerial();
+
+  unsigned long tActual = millis();
+  if (tActual - tPrev >= T_MUESTREO) {
+    tPrev = tActual;
+
+    float distancia = calculaDistancia();
+    float posicion = distancia - DIST_CENTRO;  
+
+    error = referencia - posicion;
+
+    float P = kp * error;
+    
+    integral += error;
+    integral = constrain(integral, -maxIntegral, maxIntegral);
+    float I = ki * integral;
+    
+    float D = kd * (error - errorAnterior);
+    errorAnterior = error;
+
+    PID_output = P + I + D;
+
+    int angulo = ANG_CENTRO - (int)PID_output;
+    angulo = constrain(angulo, ANG_MIN, ANG_MAX);
+    
+    myservo.write(angulo);
+
+    Serial.print("Dist: "); Serial.print(distancia);
+    Serial.print("  Pos: "); Serial.print(posicion);
+    Serial.print("  Ref: "); Serial.print(referencia);
+    Serial.print("  Error: "); Serial.print(error);
+    Serial.print("  Servo: "); Serial.print(angulo);
+    Serial.print("  KP: "); Serial.print(kp);
+    Serial.print("  KI: "); Serial.print(ki);
+    Serial.print("  KD: "); Serial.println(kd);
+  }
+}
+
+
+float calculaDistancia() {
+  float suma = 0;
+  int lecturas = 5;
+  
+  for (int i = 0; i < lecturas; i++) {
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(1);
+    digitalWrite(trigPin, LOW);
+
+    long duracion = pulseIn(echoPin, HIGH, 30000);
+    suma += duracion * 0.034 / 2.0;
+    delayMicroseconds(500);
   }
   
-  if (millis() > time+period) {
-    time = millis();    
-    distance = get_dist(100);   
-    
-    if (pid_active) {
-      // Ejecutar PID normal
-      distance_error = distance_setpoint - distance;   
-      PID_p = kp * distance_error;
-      float dist_diference = distance_error - distance_previous_error;     
-      PID_d = kd*((distance_error - distance_previous_error)/period);
-        
-      if(-3 < distance_error && distance_error < 3) {
-        PID_i = PID_i + (ki * distance_error);
-      } else {
-        PID_i = 0;
-      }
-    
-      PID_total = PID_p + PID_i + PID_d;  
-      PID_total = map(PID_total, -150, 150, 0, 150);
-    
-      if(PID_total < 20){PID_total = 20;}
-      if(PID_total > 160) {PID_total = 160; } 
-    
-      myservo.write(PID_total+30);  
-      distance_previous_error = distance_error;
-    }
-    
-    // Enviar datos cada 10 ciclos (aprox 500ms)
-    static int counter = 0;
-    if(counter++ > 10) {
-      enviarDatos();
-      counter = 0;
-    }
+  return constrain(suma / lecturas, 2.0, 40.0);
+}
+
+
+void leerComandosSerial() {
+  if (!Serial.available()) return;
+
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+
+  int espacio = cmd.indexOf(' ');
+  if (espacio == -1) return;   // No hay número → ignorar
+
+  String clave = cmd.substring(0, espacio);
+  float valor = cmd.substring(espacio + 1).toFloat();
+
+  if (clave == "kp") {
+    kp = valor;
+    Serial.print("Nuevo Kp: "); Serial.println(kp);
+  }
+  else if (clave == "ki") {
+    ki = valor;
+    Serial.print("Nuevo Ki: "); Serial.println(ki);
+  }
+  else if (clave == "kd") {
+    kd = valor;
+    Serial.print("Nuevo Kd: "); Serial.println(kd);
+  }
+  else if (clave == "r") {
+    referencia = valor;
+    integral = 0;
+    Serial.print("Nueva referencia: "); Serial.println(referencia);
   }
 }
 
-void serialEvent() {
-  while (Serial.available()) {
-    char inChar = (char)Serial.read();
-    inputString += inChar;
-    if (inChar == '\n') {
-      stringComplete = true;
-    }
-  }
-}
-
-void procesarComando() {
-  inputString.trim();
-  
-  if (inputString.startsWith("KP:")) {
-    kp = inputString.substring(3).toFloat();
-    Serial.print("KP cambiado a: ");
-    Serial.println(kp);
-  }
-  else if (inputString.startsWith("KI:")) {
-    ki = inputString.substring(3).toFloat();
-    Serial.print("KI cambiado a: ");
-    Serial.println(ki);
-  }
-  else if (inputString.startsWith("KD:")) {
-    kd = inputString.substring(3).toFloat();
-    Serial.print("KD cambiado a: ");
-    Serial.println(kd);
-  }
-  else if (inputString.startsWith("SET:")) {
-    distance_setpoint = inputString.substring(4).toFloat();
-    Serial.print("Setpoint cambiado a: ");
-    Serial.println(distance_setpoint);
-  }
-  else if (inputString == "TOGGLE") {
-    pid_active = !pid_active;
-    Serial.print("PID ");
-    Serial.println(pid_active ? "Activado" : "Desactivado");
-  }
-  else if (inputString == "STATUS") {
-    enviarEstado();
-  }
-  else if (inputString == "RESET") {
-    PID_i = 0;
-    distance_previous_error = 0;
-    Serial.println("PID resetado");
-  }
-  else {
-    Serial.println("Comando no reconocido");
-  }
-}
-
-void enviarDatos() {
-  Serial.print("DATA:");
-  Serial.print(distance);
-  Serial.print(",");
-  Serial.print(PID_total);
-  Serial.print(",");
-  Serial.print(pid_active);
-  Serial.print(",");
-  Serial.print(kp);
-  Serial.print(",");
-  Serial.print(ki);
-  Serial.print(",");
-  Serial.print(kd);
-  Serial.print(",");
-  Serial.println(distance_setpoint);
-}
-
-void enviarEstado() {
-  Serial.print("ESTADO:KP=");
-  Serial.print(kp);
-  Serial.print(",KI=");
-  Serial.print(ki);
-  Serial.print(",KD=");
-  Serial.print(kd);
-  Serial.print(",SET=");
-  Serial.print(distance_setpoint);
-  Serial.print(",PID=");
-  Serial.println(pid_active ? "ON" : "OFF");
-}
-
-float get_dist(int n) {
-  long sum=0;
-  for(int i=0;i<n;i++) {
-    sum=sum+analogRead(Analog_in);
-  }  
-  float adc=sum/n;
-  float distance_cm = 17569.7 * pow(adc, -1.2062);
-  return(distance_cm);
-}
